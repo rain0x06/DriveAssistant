@@ -42,4 +42,18 @@
     <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
   </ItemGroup>
 
+  <Target Name="RunWpfAfterBuild"
+          AfterTargets="Build"
+          Condition="'$(DesignTimeBuild)' != 'true' and '$(DisableWpfAutoRun)' != 'true' and Exists('$(TargetDir)$(AssemblyName).exe')">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;$exe = Join-Path '$(TargetDir)' '$(AssemblyName).exe'; if (Test-Path -LiteralPath $exe) { Start-Process -FilePath $exe }&quot;" />
+  </Target>
+
+  <Target Name="StopRunningWpfBeforeBuild"
+          BeforeTargets="Build"
+          Condition="'$(DesignTimeBuild)' != 'true' and '$(DisableWpfAutoRun)' != 'true'">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;Get-Process -Name 'Drive Assistant' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue&quot;"
+          ContinueOnError="true"
+          IgnoreExitCode="true" />
+  </Target>
+
 </Project>

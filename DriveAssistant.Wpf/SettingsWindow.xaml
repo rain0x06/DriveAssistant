@@ -14,16 +14,22 @@
         Foreground="{DynamicResource TextBrush}"
         StateChanged="Window_StateChanged">
     <Window.Resources>
+        <Thickness x:Key="SettingsComboFieldPadding">10,0,0,0</Thickness>
+        <Thickness x:Key="SettingsTextFieldPadding">3,0,0,0</Thickness>
         <Style x:Key="SettingsComboBox" TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
             <Setter Property="Background" Value="{DynamicResource InputBgBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}" />
             <Setter Property="MinHeight" Value="34" />
-            <Setter Property="Padding" Value="8,0" />
+            <Setter Property="Padding" Value="{StaticResource SettingsComboFieldPadding}" />
         </Style>
         <Style x:Key="SettingsTextBox" TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
             <Setter Property="MinHeight" Value="34" />
-            <Setter Property="Padding" Value="8,0" />
+            <Setter Property="Padding" Value="{StaticResource SettingsTextFieldPadding}" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style x:Key="SettingsShortcutTextBox" TargetType="TextBox" BasedOn="{StaticResource SettingsTextBox}">
+            <Setter Property="Height" Value="30" />
+            <Setter Property="MinHeight" Value="30" />
         </Style>
         <Style x:Key="TitleBarControlButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
             <Setter Property="FocusVisualStyle" Value="{x:Null}" />
@@ -294,9 +300,7 @@
                                             <DataGridTemplateColumn.CellTemplate>
                                                 <DataTemplate>
                                                     <TextBox Text="{Binding Gesture, UpdateSourceTrigger=PropertyChanged}"
-                                                             Height="30"
-                                                             MinHeight="30"
-                                                             Padding="8,3"
+                                                             Style="{StaticResource SettingsShortcutTextBox}"
                                                              BorderBrush="{DynamicResource LineBrush}"
                                                              Background="{DynamicResource InputBgBrush}"
                                                              VerticalAlignment="Center"

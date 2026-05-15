@@ -13,6 +13,7 @@ namespace FATX.FileSystem
         private readonly long _partitionLength;
 
         public const uint VolumeSignature = 0x58544146;
+        public const uint VolumeSignatureSwapped = 0x46415458;
 
         private uint _signature;
         private uint _serialNumber;
@@ -139,7 +140,8 @@ namespace FATX.FileSystem
             ReadFileAllocationTable();
 
             _root = ReadDirectoryStream(_rootDirFirstCluster);
-            PopulateDirentStream(_root, _rootDirFirstCluster);
+            var visitedDirectoryClusters = new HashSet<uint> { _rootDirFirstCluster };
+            PopulateDirentStream(_root, _rootDirFirstCluster, visitedDirectoryClusters, 0);
 
             Mounted = true;
         }
@@ -169,7 +171,7 @@ namespace FATX.FileSystem
             _sectorsPerCluster = _reader.ReadUInt32();
             _rootDirFirstCluster = _reader.ReadUInt32();
 
-            if (_signature != VolumeSignature)
+            if (_signature != VolumeSignature && _signature != VolumeSignatureSwapped)
             {
                 throw new FormatException($"Invalid FATX Signature for {_partitionName}: {_signature:X8}");
             }
@@ -182,7 +184,7 @@ namespace FATX.FileSystem
             _signature = _reader.ReadUInt32();              // FATX
             _serialNumber = _reader.ReadUInt32();           // 05C29C00
 
-            if (_signature != VolumeSignature)
+            if (_signature != VolumeSignature && _signature != VolumeSignatureSwapped)
             {
                 throw new FormatException($"Invalid FATX Signature for {_partitionName}: {_signature:X8}");
             }
@@ -315,8 +317,14 @@ namespace FATX.FileSystem
         /// </summary>
         /// <param name="stream"></param>
         /// <param name="clusterIndex"></param>
-        private void PopulateDirentStream(List<DirectoryEntry> stream, uint clusterIndex)
+        private void PopulateDirentStream(List<DirectoryEntry> stream, uint clusterIndex, HashSet<uint> visitedDirectoryClusters, int depth)
         {
+            if (depth > _maxClusters)
+            {
+                Console.WriteLine($"Directory recursion exceeded safe depth while populating cluster {clusterIndex}.");
+                return;
+            }
+
             foreach (DirectoryEntry dirent in stream)
             {
                 dirent.Cluster = clusterIndex;
@@ -328,11 +336,22 @@ namespace FATX.FileSystem
 
                     foreach (uint cluster in chainMap)
                     {
+                        if (cluster == 0 || cluster >= _fileAllocationTable.Length)
+                        {
+                            continue;
+                        }
+
+                        if (!visitedDirectoryClusters.Add(cluster))
+                        {
+                            Console.WriteLine($"Skipping recursive directory loop at cluster {cluster} for {dirent.GetFullPath()}.");
+                            continue;
+                        }
+
                         List<DirectoryEntry> direntStream = ReadDirectoryStream(cluster);
 
                         dirent.AddChildren(direntStream);
 
-                        PopulateDirentStream(direntStream, cluster);
+                        PopulateDirentStream(direntStream, cluster, visitedDirectoryClusters, depth + 1);
                     }
                 }
             }

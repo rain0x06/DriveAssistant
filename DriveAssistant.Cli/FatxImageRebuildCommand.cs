@@ -13,6 +13,7 @@ internal static class FatxImageRebuildCommand
     private const uint SectorSize = 0x200;
     private const uint SectorsPerCluster = 0x20;
     private const uint RootCluster = 0x1;
+    private static ReadOnlySpan<byte> XtafHeaderSignature => [0x58, 0x54, 0x41, 0x46];
     private const int DirentSize = 0x40;
     private const int DirentsPerCluster = 0x100;
     private const int Error = 1;
@@ -105,7 +106,10 @@ internal static class FatxImageRebuildCommand
         using var stream = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
         stream.SetLength(outputLength);
 
-        var stats = RebuildPartition(stream, snapshot, partition, nodes, options.SerialNumber, execution);
+        var effectiveSerial = options.SerialNumber != 0
+            ? options.SerialNumber
+            : partition.SerialNumber;
+        var stats = RebuildPartition(stream, snapshot, partition, nodes, effectiveSerial, execution);
         if (defaultCancellation != null)
         {
             Console.WriteLine();
@@ -156,7 +160,7 @@ internal static class FatxImageRebuildCommand
         var allFiles = new List<RebuildNode>();
         CollectFileNodes(rootEntries, allFiles);
 
-        var totalStages = Math.Max(1, 4 + allDirectories.Count + allFiles.Count);
+        var totalStages = Math.Max(1, 5 + allDirectories.Count + allFiles.Count);
         var completedStages = 0L;
         ReportProgress(execution, "Rebuild", completedStages, totalStages, "Preparing layout");
 
@@ -185,6 +189,11 @@ internal static class FatxImageRebuildCommand
             completedStages++;
             ReportProgress(execution, "Allocate files", completedStages, totalStages, file.RelativePath);
         }
+
+        ObserveExecution(execution);
+        FillPartitionRegion(stream, layout.PartitionOffset, partition.Length, 0xFF, execution);
+        completedStages++;
+        ReportProgress(execution, "Initialize partition", completedStages, totalStages, "Filled partition with 0xFF");
 
         ObserveExecution(execution);
         WriteDevkitHeader(stream, snapshot.Partitions);
@@ -462,6 +471,7 @@ internal static class FatxImageRebuildCommand
         {
             ObserveExecution(execution);
             clusterBuffers[index] = new byte[layout.BytesPerCluster];
+            Array.Fill(clusterBuffers[index], (byte)0xFF);
         }
 
         for (var entryIndex = 0; entryIndex < entries.Count; entryIndex++)
@@ -666,12 +676,32 @@ internal static class FatxImageRebuildCommand
     private static void WriteFatxHeader(FileStream stream, FatxLayout layout, uint serialNumber)
     {
         Span<byte> header = stackalloc byte[0x10];
-        Encoding.ASCII.GetBytes("FATX").CopyTo(header);
+        XtafHeaderSignature.CopyTo(header);
         BinaryPrimitives.WriteUInt32BigEndian(header.Slice(4, 4), serialNumber);
         BinaryPrimitives.WriteUInt32BigEndian(header.Slice(8, 4), SectorsPerCluster);
         BinaryPrimitives.WriteUInt32BigEndian(header.Slice(12, 4), RootCluster);
         stream.Position = layout.PartitionOffset;
         stream.Write(header);
+    }
+
+    private static void FillPartitionRegion(FileStream stream, long offset, long length, byte value, RebuildExecutionOptions execution)
+    {
+        if (length <= 0)
+        {
+            return;
+        }
+
+        stream.Position = offset;
+        var buffer = new byte[1024 * 1024];
+        Array.Fill(buffer, value);
+        var remaining = length;
+        while (remaining > 0)
+        {
+            ObserveExecution(execution);
+            var chunk = (int)Math.Min(buffer.Length, remaining);
+            stream.Write(buffer, 0, chunk);
+            remaining -= chunk;
+        }
     }
 
     private static void WriteDevkitHeader(FileStream stream, IReadOnlyList<RebuildPartitionSnapshot> partitions)
@@ -991,6 +1021,7 @@ internal static class FatxImageRebuildCommand
                 Name = GetJsonString(partitionElement, "Name"),
                 Offset = GetJsonInt64(partitionElement, "Offset"),
                 Length = GetJsonInt64(partitionElement, "Length"),
+                SerialNumber = GetJsonUInt32(partitionElement, "SerialNumber"),
                 Family = "FATX",
                 Status = "Loaded from legacy FATXTools database",
                 TotalSpace = GetJsonInt64(partitionElement, "Length")
@@ -1140,6 +1171,32 @@ internal static class FatxImageRebuildCommand
     {
         var value = GetJsonInt64(element, propertyName);
         return (int)Math.Clamp(value, int.MinValue, int.MaxValue);
+    }
+
+    private static uint GetJsonUInt32(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value))
+        {
+            return 0;
+        }
+
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetUInt32(out var number))
+        {
+            return number;
+        }
+
+        var text = value.ToString().Trim();
+        if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            text = text[2..];
+            return uint.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hex)
+                ? hex
+                : 0;
+        }
+
+        return uint.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : 0;
     }
 
     private static RebuildOptions PromptMissing(RebuildOptions options)
@@ -1661,6 +1718,8 @@ internal sealed class RebuildPartitionSnapshot
     public long Offset { get; set; }
 
     public long Length { get; set; }
+
+    public uint SerialNumber { get; set; }
 
     public string Family { get; set; } = string.Empty;
 

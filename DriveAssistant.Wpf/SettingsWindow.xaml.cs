@@ -3,11 +3,16 @@ using Microsoft.Win32;
 using System;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Globalization;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Input;
+using System.Windows.Media;
 
 namespace FATXTools.Wpf;
 
@@ -62,6 +67,9 @@ public partial class SettingsWindow : Window
         CustomCarversTextBox.Text = AppSettings.NormalizeCustomCarversFile(_settings.CustomCarversFile);
         ResetShortcutRows(ShortcutCatalog.Normalize(_settings.Shortcuts));
         ApplyWindowStatePadding();
+#if DEBUG
+        Loaded += SettingsWindow_Loaded;
+#endif
     }
 
     public AppSettings Result => _settings;
@@ -298,6 +306,193 @@ public partial class SettingsWindow : Window
             ? new Thickness(6)
             : new Thickness(0);
     }
+
+#if DEBUG
+    private void SettingsWindow_Loaded(object sender, RoutedEventArgs e)
+    {
+        if (_debugInsetOverlayApplied)
+        {
+            return;
+        }
+
+        _debugInsetOverlayApplied = true;
+        AddInsetDebugOverlay(ScanProfileCombo);
+        AddInsetDebugOverlay(MetadataWorkersCombo);
+        AddInsetDebugOverlay(MetadataIntervalTextBox);
+        AddInsetDebugOverlay(FileCarverIntervalCombo);
+        AddInsetDebugOverlay(ThemeCombo);
+        AddInsetDebugOverlay(ZeroFillOverwrittenRecoveryClustersCombo);
+        AddInsetDebugOverlay(EnableFileLoggingCombo);
+        AddInsetDebugOverlay(LogFileTextBox);
+        AddInsetDebugOverlay(CustomCarversTextBox);
+    }
+
+    private static void AddInsetDebugOverlay(Control control)
+    {
+        var layer = AdornerLayer.GetAdornerLayer(control);
+        if (layer == null)
+        {
+            return;
+        }
+
+        layer.Add(new FieldInsetDebugAdorner(control));
+    }
+#endif
+
+    private static double MeasureTextInset(Control control)
+    {
+        if (control is TextBox textBox)
+        {
+            var marker = FindTextBoxMarker(textBox);
+            if (marker == null)
+            {
+                return 0;
+            }
+
+            try
+            {
+                var topLeft = marker.TransformToAncestor(textBox).Transform(new Point(0, 0));
+                var textBoxViewMargin = string.Equals(marker.GetType().Name, "TextBoxView", StringComparison.Ordinal)
+                    ? ((FrameworkElement)marker).Margin.Left
+                    : 0;
+                return Math.Round(Math.Max(0, topLeft.X + textBoxViewMargin), 2);
+            }
+            catch (InvalidOperationException)
+            {
+                return 0;
+            }
+        }
+
+        var comboMarker = control is ComboBox comboBox ? FindComboTextMarker(comboBox) : null;
+        if (comboMarker == null)
+        {
+            return 0;
+        }
+
+        try
+        {
+            var topLeft = comboMarker.TransformToAncestor(control).Transform(new Point(0, 0));
+            return Math.Round(Math.Max(0, topLeft.X), 2);
+        }
+        catch (InvalidOperationException)
+        {
+            return 0;
+        }
+    }
+
+    private static FrameworkElement? FindTextBoxMarker(TextBox textBox)
+    {
+        var textBoxView = FindVisualDescendant<FrameworkElement>(textBox, element => string.Equals(element.GetType().Name, "TextBoxView", StringComparison.Ordinal));
+        if (textBoxView != null)
+        {
+            return textBoxView;
+        }
+
+        return textBox.Template?.FindName("PART_ContentHost", textBox) as FrameworkElement;
+    }
+
+    private static FrameworkElement? FindComboTextMarker(ComboBox comboBox)
+    {
+        var toggleButton = FindVisualDescendant<ToggleButton>(comboBox);
+        if (toggleButton == null)
+        {
+            return null;
+        }
+
+        return FindVisualDescendant<TextBlock>(toggleButton, textBlock => textBlock.TextTrimming == TextTrimming.CharacterEllipsis);
+    }
+
+    private static T? FindVisualDescendant<T>(DependencyObject root, Func<T, bool>? match = null)
+        where T : DependencyObject
+    {
+        for (var i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is T typed && (match == null || match(typed)))
+            {
+                return typed;
+            }
+
+            var nested = FindVisualDescendant(child, match);
+            if (nested != null)
+            {
+                return nested;
+            }
+        }
+
+        return null;
+    }
+
+    internal Dictionary<string, double> CollectInsetMeasurements()
+    {
+        var result = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["combo.scan_profile"] = MeasureTextInset(ScanProfileCombo),
+            ["combo.metadata_workers"] = MeasureTextInset(MetadataWorkersCombo),
+            ["combo.file_carver_interval"] = MeasureTextInset(FileCarverIntervalCombo),
+            ["combo.theme"] = MeasureTextInset(ThemeCombo),
+            ["combo.zero_fill"] = MeasureTextInset(ZeroFillOverwrittenRecoveryClustersCombo),
+            ["combo.log_to_file"] = MeasureTextInset(EnableFileLoggingCombo),
+            ["textbox.metadata_interval_clusters"] = MeasureTextInset(MetadataIntervalTextBox),
+            ["textbox.log_file"] = MeasureTextInset(LogFileTextBox),
+            ["textbox.custom_carvers_file"] = MeasureTextInset(CustomCarversTextBox)
+        };
+
+        return result;
+    }
+
+#if DEBUG
+    private bool _debugInsetOverlayApplied;
+
+    private sealed class FieldInsetDebugAdorner : Adorner
+    {
+        public FieldInsetDebugAdorner(Control adornedElement)
+            : base(adornedElement)
+        {
+            IsHitTestVisible = false;
+            adornedElement.LayoutUpdated += (_, _) => InvalidateVisual();
+        }
+
+        protected override void OnRender(DrawingContext drawingContext)
+        {
+            base.OnRender(drawingContext);
+            if (AdornedElement is not Control control || control.ActualWidth <= 1 || control.ActualHeight <= 1)
+            {
+                return;
+            }
+
+            Point controlTopLeft;
+            try
+            {
+                controlTopLeft = control.TranslatePoint(new Point(0, 0), this);
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+
+            var insetPx = Math.Min(control.ActualWidth - 1, MeasureTextInset(control));
+            var y = controlTopLeft.Y + Math.Max(3, control.ActualHeight - 7);
+            var lineStartX = controlTopLeft.X;
+            var lineEndX = controlTopLeft.X + insetPx;
+            var linePen = new Pen(Brushes.Red, 1);
+            drawingContext.DrawLine(linePen, new Point(lineStartX, y), new Point(lineEndX, y));
+
+            var label = $"{insetPx:0.##} px";
+            var formattedText = new FormattedText(
+                label,
+                CultureInfo.InvariantCulture,
+                FlowDirection.LeftToRight,
+                new Typeface("Consolas"),
+                10,
+                Brushes.Red,
+                VisualTreeHelper.GetDpi(this).PixelsPerDip);
+
+            drawingContext.DrawText(formattedText, new Point(lineStartX + 2, Math.Max(0, y - formattedText.Height - 1)));
+        }
+    }
+
+#endif
 }
 
 public sealed record IntervalOption(string Name, string SizeText, FileCarverInterval Value)

@@ -234,7 +234,7 @@ public partial class ConsoleImageOpenWindow : Window
 
     private void UpdateFilesystemTypeHint()
     {
-        const string typingHint = "Type in this box to filter filesystem types. Press Down Arrow to open the full list.";
+        const string typingHint = "Select a filesystem type from the list.";
         if (ImageKindComboBox.SelectedItem is ConsoleImageKindOption legacyOption &&
             legacyOption.Kind == ConsoleDriveImageKind.LegacyDevkitMedia &&
             !string.IsNullOrWhiteSpace(legacyOption.HelpText))
@@ -282,7 +282,7 @@ public partial class ConsoleImageOpenWindow : Window
 
         _filesystemTypeTextBox.TextChanged += FilesystemTypeTextBox_TextChanged;
         _filesystemTypeTextBox.GotKeyboardFocus += (_, _) => ImageKindComboBox.IsDropDownOpen = true;
-        _filesystemTypeTextBox.ToolTip = CreateWrappedToolTip("Type here to filter filesystem types (for example: pla, xbox, nintendo).");
+        _filesystemTypeTextBox.ToolTip = CreateWrappedToolTip("Select a filesystem type from the list.");
     }
 
     private void FilesystemTypeTextBox_TextChanged(object sender, TextChangedEventArgs e)

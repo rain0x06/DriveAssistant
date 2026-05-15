@@ -1,7 +1,6 @@
 <Application x:Class="FATXTools.Wpf.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             StartupUri="MainWindow.xaml">
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <Application.Resources>
         <Color x:Key="AppBg">#111522</Color>
         <Color x:Key="ToolbarBg">#171D2B</Color>
@@ -376,7 +375,7 @@
                                                     <ColumnDefinition Width="*" />
                                                     <ColumnDefinition Width="30" />
                                                 </Grid.ColumnDefinitions>
-                                                <TextBlock Margin="8,0,0,0"
+                                                <TextBlock Margin="{Binding Padding, RelativeSource={RelativeSource AncestorType=ComboBox}}"
                                                            VerticalAlignment="Center"
                                                            HorizontalAlignment="Left"
                                                            Foreground="{DynamicResource TextBrush}"

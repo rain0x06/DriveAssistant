@@ -34,8 +34,7 @@
             <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}" />
             <Setter Property="ItemContainerStyle" Value="{StaticResource DarkComboBoxItemStyle}" />
-            <Setter Property="IsEditable" Value="True" />
-            <Setter Property="StaysOpenOnEdit" Value="True" />
+            <Setter Property="IsEditable" Value="False" />
             <Setter Property="IsTextSearchEnabled" Value="True" />
             <Setter Property="MaxDropDownHeight" Value="240" />
         </Style>

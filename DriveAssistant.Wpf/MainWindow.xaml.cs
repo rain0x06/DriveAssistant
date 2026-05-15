@@ -5902,6 +5902,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         LoadSelectedPartition();
+        if (MetadataResults.Count > 0)
+        {
+            ShowMetadataResultsInFileTable(
+                $"{SelectedPartition?.Name ?? "FATX"} metadata",
+                $"{SelectedPartition?.Name ?? "FATX"} restored metadata: {MetadataResults.Count:N0} entries");
+        }
         RefreshSelectionState();
     }
 
