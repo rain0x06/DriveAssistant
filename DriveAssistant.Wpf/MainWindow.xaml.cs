@@ -654,7 +654,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                             progressDialog.Update(snapshot.Percent, snapshot.Stage, snapshot.Detail);
                             StatusText = Volatile.Read(ref pauseFlag) == 1
                                 ? "FATX rebuild paused"
-                                : $"Rebuilding FATX image from JSON... {snapshot.Percent:0}%";
+                                : $"Rebuilding FATX image from JSON... {snapshot.Percent:0}% - {snapshot.Stage}: {snapshot.Detail}";
                         });
                     }
                 });
@@ -7138,6 +7138,7 @@ internal sealed class RebuildProgressDialog : Window
     private readonly TextBlock _stageText;
     private readonly TextBlock _detailText;
     private readonly Button _pauseButton;
+    private readonly ProgressEtaEstimator _etaEstimator = new();
     private bool _isPaused;
 
     public RebuildProgressDialog()
@@ -7232,9 +7233,13 @@ internal sealed class RebuildProgressDialog : Window
 
     public void Update(int percent, string stage, string detail)
     {
-        _progressBar.Value = Math.Clamp(percent, 0, 100);
-        _stageText.Text = $"{Math.Clamp(percent, 0, 100):0}% - {stage}";
-        _detailText.Text = detail;
+        var clampedPercent = Math.Clamp(percent, 0, 100);
+        _progressBar.Value = clampedPercent;
+        _stageText.Text = $"{clampedPercent:0}% - {stage}";
+        var etaText = _etaEstimator.BuildStatus(clampedPercent, stage);
+        _detailText.Text = string.IsNullOrWhiteSpace(etaText)
+            ? detail
+            : $"{detail} | {etaText}";
     }
 }
 
@@ -9029,6 +9034,7 @@ public sealed class ScanProgressRow : INotifyPropertyChanged
 {
     private double _value;
     private string _text = "0%";
+    private readonly ProgressEtaEstimator _etaEstimator = new();
 
     public ScanProgressRow(string title)
     {
@@ -9072,7 +9078,121 @@ public sealed class ScanProgressRow : INotifyPropertyChanged
     public void Update(double value, string text)
     {
         Value = value;
-        Text = text;
+        var etaText = _etaEstimator.BuildStatus(value, text);
+        Text = string.IsNullOrWhiteSpace(etaText)
+            ? text
+            : $"{text} | {etaText}";
+    }
+}
+
+internal sealed class ProgressEtaEstimator
+{
+    private readonly Queue<(DateTime TimestampUtc, double Percent)> _samples = new();
+    private DateTime _startedAtUtc = DateTime.UtcNow;
+    private double _lastPercent = double.NaN;
+
+    public string BuildStatus(double percent, string? stateText)
+    {
+        var now = DateTime.UtcNow;
+        var clampedPercent = Math.Clamp(percent, 0d, 100d);
+        if (double.IsNaN(_lastPercent) || clampedPercent + 0.001 < _lastPercent)
+        {
+            Reset(now, clampedPercent);
+        }
+
+        TrackSample(now, clampedPercent);
+
+        var elapsed = now - _startedAtUtc;
+        if (clampedPercent >= 100 || IsTerminal(stateText))
+        {
+            return $"Elapsed {FormatDuration(elapsed)}";
+        }
+
+        var eta = TryEstimateEta(now, clampedPercent);
+        if (eta == null)
+        {
+            return $"ETA calculating, elapsed {FormatDuration(elapsed)}";
+        }
+
+        return $"ETA {FormatDuration(eta.Value)}, elapsed {FormatDuration(elapsed)}";
+    }
+
+    private void Reset(DateTime now, double percent)
+    {
+        _samples.Clear();
+        _startedAtUtc = now;
+        _lastPercent = percent;
+    }
+
+    private void TrackSample(DateTime now, double percent)
+    {
+        if (_samples.Count == 0 || percent > _lastPercent + 0.001)
+        {
+            _samples.Enqueue((now, percent));
+        }
+        else if (_samples.Count == 0)
+        {
+            _samples.Enqueue((now, percent));
+        }
+
+        _lastPercent = Math.Max(_lastPercent, percent);
+        var cutoff = now - TimeSpan.FromSeconds(45);
+        while (_samples.Count > 2 && _samples.Peek().TimestampUtc < cutoff)
+        {
+            _samples.Dequeue();
+        }
+    }
+
+    private TimeSpan? TryEstimateEta(DateTime now, double percent)
+    {
+        if (percent <= 0.1 || _samples.Count < 2)
+        {
+            return null;
+        }
+
+        var first = _samples.Peek();
+        var latest = _samples.Last();
+        var deltaPercent = latest.Percent - first.Percent;
+        var deltaSeconds = (latest.TimestampUtc - first.TimestampUtc).TotalSeconds;
+        if (deltaPercent <= 0.01 || deltaSeconds <= 0.1)
+        {
+            return null;
+        }
+
+        var percentPerSecond = deltaPercent / deltaSeconds;
+        if (percentPerSecond <= 0)
+        {
+            return null;
+        }
+
+        var remainingPercent = Math.Max(0, 100 - percent);
+        return TimeSpan.FromSeconds(remainingPercent / percentPerSecond);
+    }
+
+    private static bool IsTerminal(string? stateText)
+    {
+        if (string.IsNullOrWhiteSpace(stateText))
+        {
+            return false;
+        }
+
+        return stateText.Contains("canceled", StringComparison.OrdinalIgnoreCase)
+            || stateText.Contains("failed", StringComparison.OrdinalIgnoreCase)
+            || stateText.Contains("complete", StringComparison.OrdinalIgnoreCase)
+            || stateText.Contains("done", StringComparison.OrdinalIgnoreCase)
+            || stateText.Contains("ready", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FormatDuration(TimeSpan value)
+    {
+        if (value < TimeSpan.Zero)
+        {
+            value = TimeSpan.Zero;
+        }
+
+        return value.TotalHours >= 1
+            ? value.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture)
+            : value.ToString(@"mm\:ss", CultureInfo.InvariantCulture);
     }
 }
 

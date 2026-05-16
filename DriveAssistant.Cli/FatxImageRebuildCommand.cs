@@ -32,19 +32,37 @@ internal static class FatxImageRebuildCommand
             defaultCancellation = new CancellationTokenSource();
             var lastPercent = -1;
             string? lastStage = null;
+            string? lastDetail = null;
+            var lastWriteUtc = DateTime.MinValue;
+            var etaEstimator = new ProgressEtaEstimator();
+            var consoleProgressLock = new object();
             execution = new RebuildExecutionOptions
             {
                 CancellationToken = defaultCancellation.Token,
                 Progress = snapshot =>
                 {
-                    if (snapshot.Percent == lastPercent && string.Equals(snapshot.Stage, lastStage, StringComparison.Ordinal))
+                    lock (consoleProgressLock)
                     {
-                        return;
-                    }
+                        var now = DateTime.UtcNow;
+                        if (snapshot.Percent == lastPercent &&
+                            string.Equals(snapshot.Stage, lastStage, StringComparison.Ordinal) &&
+                            string.Equals(snapshot.Detail, lastDetail, StringComparison.Ordinal) &&
+                            now - lastWriteUtc < TimeSpan.FromSeconds(1))
+                        {
+                            return;
+                        }
 
-                    lastPercent = snapshot.Percent;
-                    lastStage = snapshot.Stage;
-                    Console.Write($"\r[{snapshot.Percent,3}%] {snapshot.Stage} - {snapshot.Detail}   ");
+                        lastPercent = snapshot.Percent;
+                        lastStage = snapshot.Stage;
+                        lastDetail = snapshot.Detail;
+                        lastWriteUtc = now;
+                        var etaText = etaEstimator.BuildStatus(snapshot.Percent, snapshot.Stage);
+                        var detail = string.IsNullOrWhiteSpace(etaText)
+                            ? snapshot.Detail
+                            : $"{snapshot.Detail} | {etaText}";
+                        Console.Write($"\r[{snapshot.Percent,3}%] {snapshot.Stage} - {detail}   ");
+                        Console.Out.Flush();
+                    }
                 }
             };
 
@@ -79,7 +97,7 @@ internal static class FatxImageRebuildCommand
             return Error;
         }
 
-        var snapshot = LoadSnapshot(options.SnapshotPath);
+        var snapshot = LoadSnapshot(options.SnapshotPath, execution);
         var partition = SelectPartition(snapshot, options.PartitionSelector);
         if (partition.Length <= 0)
         {
@@ -87,8 +105,23 @@ internal static class FatxImageRebuildCommand
             return Error;
         }
 
-        var sourceIndex = SourceIndex.Build(options.LiveFilesDirectory, options.DeletedFilesDirectory);
-        var nodes = BuildIncludedTree(partition.OriginalFilesystem, parentPath: string.Empty, partition.Name, sourceIndex, options.IncludeDeletedEntries);
+        var rebuildEntries = partition.OriginalFilesystem.Count > 0
+            ? partition.OriginalFilesystem
+            : partition.Analysis.MetadataAnalyzer;
+        ReportProgress(
+            execution,
+            "Load snapshot",
+            0,
+            0,
+            partition.OriginalFilesystem.Count > 0
+                ? $"Using original filesystem tree with {CountSnapshotEntriesRecursive(rebuildEntries):N0} metadata entries"
+                : $"Using metadata analyzer tree with {CountSnapshotEntriesRecursive(rebuildEntries):N0} recovered entries");
+
+        var sourceIndex = SourceIndex.Build(options.LiveFilesDirectory, options.DeletedFilesDirectory, execution);
+        var treeProgress = new RebuildTreeBuildProgress();
+        var nodes = BuildIncludedTree(rebuildEntries, parentPath: string.Empty, partition.Name, sourceIndex, options.IncludeDeletedEntries, execution, treeProgress);
+        AddUnmatchedSourceFiles(nodes, sourceIndex, treeProgress, execution);
+        ReportProgress(execution, "Build tree", 0, 0, $"Included {treeProgress.IncludedNodes:N0} entries ({treeProgress.IncludedDirectories:N0} dirs, {treeProgress.IncludedFiles:N0} files); visited {treeProgress.VisitedEntries:N0}");
         var outputPath = Path.GetFullPath(options.OutputImagePath);
         var parent = Path.GetDirectoryName(outputPath);
         if (!string.IsNullOrWhiteSpace(parent))
@@ -109,7 +142,7 @@ internal static class FatxImageRebuildCommand
         var effectiveSerial = options.SerialNumber != 0
             ? options.SerialNumber
             : partition.SerialNumber;
-        var stats = RebuildPartition(stream, snapshot, partition, nodes, effectiveSerial, execution);
+        var stats = RebuildPartition(stream, snapshot, partition, rebuildEntries, nodes, effectiveSerial, execution);
         if (defaultCancellation != null)
         {
             Console.WriteLine();
@@ -147,6 +180,7 @@ internal static class FatxImageRebuildCommand
         FileStream stream,
         RebuildSnapshot snapshot,
         RebuildPartitionSnapshot partition,
+        IReadOnlyList<RebuildSnapshotFileEntry> rebuildEntries,
         List<RebuildNode> rootEntries,
         uint serialNumber,
         RebuildExecutionOptions execution)
@@ -168,6 +202,7 @@ internal static class FatxImageRebuildCommand
         {
             ObserveExecution(execution);
             var requiredClusters = Math.Max(1, (int)Math.Ceiling(directory.Children.Count / (double)DirentsPerCluster));
+            ReportProgress(execution, "Allocate directories", completedStages, totalStages, $"{directory.RelativePath} ({requiredClusters:N0} cluster(s))");
             directory.Clusters = TryAllocatePreferredContiguous(directory.FirstClusterHint, requiredClusters, allocator)
                 ?? allocator.AllocateContiguous(requiredClusters);
             completedStages++;
@@ -185,6 +220,7 @@ internal static class FatxImageRebuildCommand
             }
 
             var clustersNeeded = (int)Math.Ceiling(file.Size / (double)layout.BytesPerCluster);
+            ReportProgress(execution, "Allocate files", completedStages, totalStages, $"{file.RelativePath} ({FormatBytes(file.Size)}, {clustersNeeded:N0} cluster(s))");
             file.Clusters = AllocateFileClusters(file, clustersNeeded, allocator, layout.MaxUsableCluster);
             completedStages++;
             ReportProgress(execution, "Allocate files", completedStages, totalStages, file.RelativePath);
@@ -254,7 +290,7 @@ internal static class FatxImageRebuildCommand
         {
             DirectoriesWritten = totalDirs,
             FilesWritten = allFiles.Count(file => file.Clusters.Count > 0 || file.Size == 0),
-            SkippedEntries = CountSkippedEntries(partition.OriginalFilesystem, rootEntries),
+            SkippedEntries = CountSkippedEntries(rebuildEntries, rootEntries),
             IsFat16 = layout.IsFat16,
             MaxUsableCluster = layout.MaxUsableCluster
         };
@@ -262,18 +298,6 @@ internal static class FatxImageRebuildCommand
 
     private static int CountSkippedEntries(IReadOnlyList<RebuildSnapshotFileEntry> originalEntries, IReadOnlyList<RebuildNode> includedEntries)
     {
-        static int CountAll(IReadOnlyList<RebuildSnapshotFileEntry> entries)
-        {
-            var total = 0;
-            foreach (var entry in entries)
-            {
-                total++;
-                total += CountAll(entry.Children);
-            }
-
-            return total;
-        }
-
         static int CountIncluded(IReadOnlyList<RebuildNode> entries)
         {
             var total = 0;
@@ -286,7 +310,19 @@ internal static class FatxImageRebuildCommand
             return total;
         }
 
-        return Math.Max(0, CountAll(originalEntries) - CountIncluded(includedEntries));
+        return Math.Max(0, CountSnapshotEntriesRecursive(originalEntries) - CountIncluded(includedEntries));
+    }
+
+    private static int CountSnapshotEntriesRecursive(IReadOnlyList<RebuildSnapshotFileEntry> entries)
+    {
+        var total = 0;
+        foreach (var entry in entries)
+        {
+            total++;
+            total += CountSnapshotEntriesRecursive(entry.Children);
+        }
+
+        return total;
     }
 
     private static List<uint> AllocateRootDirectoryClusters(int rootEntryCount, ClusterAllocator allocator)
@@ -327,7 +363,7 @@ internal static class FatxImageRebuildCommand
             return preferred;
         }
 
-        return allocator.AllocateContiguous(clustersNeeded);
+        return allocator.AllocateAny(clustersNeeded);
     }
 
     private static List<uint>? TryAllocatePreferredContiguous(uint preferredFirstCluster, int count, ClusterAllocator allocator)
@@ -692,15 +728,24 @@ internal static class FatxImageRebuildCommand
         }
 
         stream.Position = offset;
-        var buffer = new byte[1024 * 1024];
+        var buffer = new byte[16 * 1024 * 1024];
         Array.Fill(buffer, value);
         var remaining = length;
+        var written = 0L;
+        var lastReported = 0L;
+        ReportProgress(execution, "Initialize partition", 0, length, $"Filling partition with 0x{value:X2}: {FormatBytes(0)} / {FormatBytes(length)}");
         while (remaining > 0)
         {
             ObserveExecution(execution);
             var chunk = (int)Math.Min(buffer.Length, remaining);
             stream.Write(buffer, 0, chunk);
             remaining -= chunk;
+            written += chunk;
+            if (written == length || written - lastReported >= 256L * 1024 * 1024)
+            {
+                lastReported = written;
+                ReportProgress(execution, "Initialize partition", written, length, $"Filling partition with 0x{value:X2}: {FormatBytes(written)} / {FormatBytes(length)}");
+            }
         }
     }
 
@@ -799,12 +844,14 @@ internal static class FatxImageRebuildCommand
         string parentPath,
         string partitionName,
         SourceIndex sourceIndex,
-        bool includeDeletedEntries)
+        bool includeDeletedEntries,
+        RebuildExecutionOptions execution,
+        RebuildTreeBuildProgress progress)
     {
         var results = new List<RebuildNode>();
         foreach (var entry in entries)
         {
-            var node = BuildNode(entry, parentPath, partitionName, sourceIndex, includeDeletedEntries);
+            var node = BuildNode(entry, parentPath, partitionName, sourceIndex, includeDeletedEntries, execution, progress);
             if (node != null)
             {
                 results.Add(node);
@@ -819,31 +866,43 @@ internal static class FatxImageRebuildCommand
         string parentPath,
         string partitionName,
         SourceIndex sourceIndex,
-        bool includeDeletedEntries)
+        bool includeDeletedEntries,
+        RebuildExecutionOptions execution,
+        RebuildTreeBuildProgress progress)
     {
+        var relativePath = ResolveRelativePath(entry, parentPath, partitionName);
+        progress.ObserveVisited(relativePath, execution);
+
         if (!includeDeletedEntries && entry.IsDeleted)
         {
             return null;
         }
 
-        var relativePath = ResolveRelativePath(entry, parentPath, partitionName);
-        var children = BuildIncludedTree(entry.Children, relativePath, partitionName, sourceIndex, includeDeletedEntries);
+        var children = BuildIncludedTree(entry.Children, relativePath, partitionName, sourceIndex, includeDeletedEntries, execution, progress);
 
         var isDirectory = entry.IsDirectory || string.Equals(entry.Kind, "Folder", StringComparison.OrdinalIgnoreCase);
         if (isDirectory)
         {
-            var exists = sourceIndex.HasDirectory(relativePath);
+            var exists = sourceIndex.HasDirectory(relativePath, out var canonicalDirectoryPath);
             if (!exists && children.Count == 0)
             {
                 return null;
             }
 
-            return new RebuildNode
+            var directoryDedupKey = !string.IsNullOrWhiteSpace(canonicalDirectoryPath)
+                ? $"D:{canonicalDirectoryPath}"
+                : $"D:{relativePath}";
+            if (!progress.TryIncludePath(directoryDedupKey))
+            {
+                return null;
+            }
+
+            var directory = new RebuildNode
             {
                 Name = entry.Name,
                 RelativePath = relativePath,
                 IsDirectory = true,
-                IsDeleted = entry.IsDeleted,
+                IsDeleted = false,
                 Size = -1,
                 FirstClusterHint = entry.FirstCluster,
                 Attributes = entry.Attributes,
@@ -853,10 +912,20 @@ internal static class FatxImageRebuildCommand
                 Accessed = entry.Accessed,
                 Children = children
             };
+            progress.ObserveIncluded(directory, execution);
+            return directory;
         }
 
-        var filePath = sourceIndex.FindFile(relativePath, entry.IsDeleted);
+        var filePath = sourceIndex.FindFile(relativePath, entry.IsDeleted, out var canonicalFilePath);
         if (filePath == null)
+        {
+            return null;
+        }
+
+        var fileDedupKey = !string.IsNullOrWhiteSpace(canonicalFilePath)
+            ? $"F:{canonicalFilePath}"
+            : $"F:{relativePath}";
+        if (!progress.TryIncludePath(fileDedupKey))
         {
             return null;
         }
@@ -864,14 +933,15 @@ internal static class FatxImageRebuildCommand
         var normalizedName = string.IsNullOrWhiteSpace(entry.Name)
             ? Path.GetFileName(relativePath)
             : entry.Name;
+        var sourceLength = new FileInfo(filePath).Length;
 
-        return new RebuildNode
+        var file = new RebuildNode
         {
             Name = normalizedName,
             RelativePath = relativePath,
             IsDirectory = false,
-            IsDeleted = entry.IsDeleted,
-            Size = entry.Size > 0 ? entry.Size : new FileInfo(filePath).Length,
+            IsDeleted = false,
+            Size = sourceLength,
             FirstClusterHint = entry.FirstCluster,
             Attributes = entry.Attributes,
             Extents = entry.Extents,
@@ -881,6 +951,110 @@ internal static class FatxImageRebuildCommand
             SourcePath = filePath,
             Children = []
         };
+        progress.ObserveIncluded(file, execution);
+        return file;
+    }
+
+    private static void AddUnmatchedSourceFiles(
+        List<RebuildNode> rootEntries,
+        SourceIndex sourceIndex,
+        RebuildTreeBuildProgress progress,
+        RebuildExecutionOptions execution)
+    {
+        AddUnmatchedSourceFiles(rootEntries, sourceIndex.LiveFiles, progress, execution, "live source fallback");
+        AddUnmatchedSourceFiles(rootEntries, sourceIndex.DeletedFiles, progress, execution, "recovered source fallback");
+    }
+
+    private static void AddUnmatchedSourceFiles(
+        List<RebuildNode> rootEntries,
+        IEnumerable<SourceFileRecord> sourceFiles,
+        RebuildTreeBuildProgress progress,
+        RebuildExecutionOptions execution,
+        string label)
+    {
+        foreach (var source in sourceFiles)
+        {
+            if (!progress.TryIncludePath($"F:{source.RelativePath}"))
+            {
+                continue;
+            }
+
+            var imagePath = NormalizePath(source.RelativePath);
+            if (!imagePath.StartsWith("DEVKIT/", StringComparison.OrdinalIgnoreCase))
+            {
+                imagePath = $"DEVKIT/{imagePath}";
+            }
+
+            var fileInfo = new FileInfo(source.SourcePath);
+            var node = AddSourceFileNode(rootEntries, imagePath, source.SourcePath, fileInfo);
+            progress.ObserveIncluded(node, execution);
+            if (progress.IncludedFiles % 250 == 0)
+            {
+                ReportProgress(execution, "Build tree", 0, 0, $"{label}: added {progress.IncludedFiles:N0} files; latest {ShortenProgressPath(imagePath)}");
+            }
+        }
+    }
+
+    private static RebuildNode AddSourceFileNode(
+        List<RebuildNode> rootEntries,
+        string imagePath,
+        string sourcePath,
+        FileInfo fileInfo)
+    {
+        var parts = NormalizePath(imagePath).Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+        {
+            throw new InvalidDataException($"Source file path '{imagePath}' did not contain a file name.");
+        }
+
+        var currentChildren = rootEntries;
+        var currentPath = string.Empty;
+        for (var index = 0; index < parts.Length - 1; index++)
+        {
+            var name = parts[index];
+            currentPath = string.IsNullOrWhiteSpace(currentPath) ? name : $"{currentPath}/{name}";
+            var existing = currentChildren.FirstOrDefault(entry => entry.IsDirectory && string.Equals(entry.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+            {
+                existing = new RebuildNode
+                {
+                    Name = name,
+                    RelativePath = currentPath,
+                    IsDirectory = true,
+                    IsDeleted = false,
+                    Size = -1,
+                    FirstClusterHint = 0,
+                    Attributes = "Directory",
+                    Created = fileInfo.CreationTime,
+                    Modified = fileInfo.LastWriteTime,
+                    Accessed = fileInfo.LastAccessTime,
+                    Children = []
+                };
+                currentChildren.Add(existing);
+            }
+
+            currentChildren = existing.Children;
+        }
+
+        var fileName = parts[^1];
+        var filePath = string.Join('/', parts);
+        var file = new RebuildNode
+        {
+            Name = fileName,
+            RelativePath = filePath,
+            IsDirectory = false,
+            IsDeleted = false,
+            Size = fileInfo.Length,
+            FirstClusterHint = 0,
+            Attributes = "Archive",
+            Created = fileInfo.CreationTime,
+            Modified = fileInfo.LastWriteTime,
+            Accessed = fileInfo.LastAccessTime,
+            SourcePath = sourcePath,
+            Children = []
+        };
+        currentChildren.Add(file);
+        return file;
     }
 
     private static string ResolveRelativePath(RebuildSnapshotFileEntry entry, string parentPath, string partitionName)
@@ -931,6 +1105,32 @@ internal static class FatxImageRebuildCommand
         return path.TrimEnd('/');
     }
 
+    private static string ShortenProgressPath(string path, int maxLength = 96)
+    {
+        path = NormalizePath(path);
+        if (path.Length <= maxLength)
+        {
+            return string.IsNullOrWhiteSpace(path) ? "<root>" : path;
+        }
+
+        var keep = Math.Max(1, maxLength - 3);
+        return "..." + path[^keep..];
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KiB", "MiB", "GiB", "TiB"];
+        var value = (double)Math.Max(0, bytes);
+        var unit = 0;
+        while (value >= 1024 && unit + 1 < units.Length)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return $"{value:0.##} {units[unit]}";
+    }
+
     private static RebuildPartitionSnapshot SelectPartition(RebuildSnapshot snapshot, string? selector)
     {
         var fatxPartitions = snapshot.Partitions
@@ -975,28 +1175,54 @@ internal static class FatxImageRebuildCommand
         return first;
     }
 
-    private static RebuildSnapshot LoadSnapshot(string path)
+    private static RebuildSnapshot LoadSnapshot(string path, RebuildExecutionOptions execution)
     {
+        var snapshotBytes = new FileInfo(path).Length;
+        ReportProgress(execution, "Load snapshot", 0, 0, $"Reading {Path.GetFileName(path)} ({FormatBytes(snapshotBytes)})");
         var json = File.ReadAllText(path);
+        ReportProgress(execution, "Load snapshot", 0, 0, $"Parsing JSON ({FormatBytes(snapshotBytes)})");
+
+        if (LooksLikeLegacySnapshot(json))
+        {
+            ReportProgress(execution, "Load snapshot", 0, 0, "Detected legacy FATXTools JSON; converting directly");
+            var legacy = TryConvertLegacySnapshot(json, execution);
+            if (legacy != null && legacy.Partitions.Count > 0)
+            {
+                ReportProgress(execution, "Load snapshot", 0, 0, $"Loaded legacy snapshot with {legacy.Partitions.Count:N0} partition(s)");
+                return legacy;
+            }
+        }
+
         var snapshot = JsonSerializer.Deserialize<RebuildSnapshot>(json, new JsonSerializerOptions
         {
             PropertyNameCaseInsensitive = true
         });
         if (snapshot != null && snapshot.Partitions.Count > 0)
         {
+            ReportProgress(execution, "Load snapshot", 0, 0, $"Loaded {snapshot.Partitions.Count:N0} partition(s)");
             return snapshot;
         }
 
-        var legacy = TryConvertLegacySnapshot(json);
-        if (legacy != null && legacy.Partitions.Count > 0)
+        ReportProgress(execution, "Load snapshot", 0, 0, "Converting legacy FATXTools JSON");
+        var legacyFallback = TryConvertLegacySnapshot(json, execution);
+        if (legacyFallback != null && legacyFallback.Partitions.Count > 0)
         {
-            return legacy;
+            ReportProgress(execution, "Load snapshot", 0, 0, $"Loaded legacy snapshot with {legacyFallback.Partitions.Count:N0} partition(s)");
+            return legacyFallback;
         }
 
         throw new InvalidDataException("Snapshot JSON did not contain any partitions.");
     }
 
-    private static RebuildSnapshot? TryConvertLegacySnapshot(string json)
+    private static bool LooksLikeLegacySnapshot(string json)
+    {
+        var probeLength = Math.Min(json.Length, 4096);
+        var probe = json.AsSpan(0, probeLength);
+        return probe.Contains("\"Drive\"", StringComparison.OrdinalIgnoreCase) &&
+            probe.Contains("\"Partitions\"", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static RebuildSnapshot? TryConvertLegacySnapshot(string json, RebuildExecutionOptions execution)
     {
         using var document = JsonDocument.Parse(json);
         if (!document.RootElement.TryGetProperty("Drive", out var drive) ||
@@ -1014,6 +1240,7 @@ internal static class FatxImageRebuildCommand
             SourceImage = GetJsonString(drive, "FileName")
         };
 
+        var conversionProgress = new LegacySnapshotConversionProgress();
         foreach (var partitionElement in partitionsElement.EnumerateArray())
         {
             var partition = new RebuildPartitionSnapshot
@@ -1033,23 +1260,30 @@ internal static class FatxImageRebuildCommand
             {
                 partition.Analysis.MetadataAnalyzer = metadata
                     .EnumerateArray()
-                    .Select(entry => ConvertLegacyDirectoryEntry(entry, partition.Name))
+                    .Select(entry => ConvertLegacyDirectoryEntry(entry, partition.Name, conversionProgress, execution))
                     .Where(entry => !string.IsNullOrWhiteSpace(entry.Name))
                     .ToList();
             }
 
             snapshot.Partitions.Add(partition);
+            ReportProgress(execution, "Convert legacy JSON", 0, 0, $"Converted partition {partition.Name}; {conversionProgress.EntriesConverted:N0} metadata entries");
         }
 
         return snapshot.Partitions.Count > 0 ? snapshot : null;
     }
 
-    private static RebuildSnapshotFileEntry ConvertLegacyDirectoryEntry(JsonElement entry, string partitionName, string parentPath = "")
+    private static RebuildSnapshotFileEntry ConvertLegacyDirectoryEntry(
+        JsonElement entry,
+        string partitionName,
+        LegacySnapshotConversionProgress progress,
+        RebuildExecutionOptions execution,
+        string parentPath = "")
     {
         var name = GetJsonString(entry, "FileName");
         var attributes = GetJsonInt32(entry, "FileAttributes");
         var isDirectory = (attributes & 0x10) != 0;
         var path = string.IsNullOrWhiteSpace(parentPath) ? name : $"{parentPath}/{name}";
+        progress.Observe(path, execution);
         var snapshot = new RebuildSnapshotFileEntry
         {
             Name = name,
@@ -1075,7 +1309,7 @@ internal static class FatxImageRebuildCommand
         {
             snapshot.Children = children
                 .EnumerateArray()
-                .Select(child => ConvertLegacyDirectoryEntry(child, partitionName, path))
+                .Select(child => ConvertLegacyDirectoryEntry(child, partitionName, progress, execution, path))
                 .Where(child => !string.IsNullOrWhiteSpace(child.Name))
                 .ToList();
         }
@@ -1240,6 +1474,70 @@ internal static class FatxImageRebuildCommand
         public uint MaxUsableCluster { get; init; }
     }
 
+    private sealed class RebuildTreeBuildProgress
+    {
+        public long VisitedEntries { get; private set; }
+
+        public long IncludedNodes { get; private set; }
+
+        public long IncludedDirectories { get; private set; }
+
+        public long IncludedFiles { get; private set; }
+
+        private readonly HashSet<string> _includedPaths = new(StringComparer.OrdinalIgnoreCase);
+
+        public bool TryIncludePath(string path)
+        {
+            return _includedPaths.Add(NormalizePath(path));
+        }
+
+        public void ObserveVisited(string relativePath, RebuildExecutionOptions execution)
+        {
+            VisitedEntries++;
+            if (VisitedEntries == 1 || VisitedEntries % 250 == 0)
+            {
+                ReportProgress(execution, "Build tree", 0, 0, $"Visited {VisitedEntries:N0} metadata entries; latest {ShortenProgressPath(relativePath)}");
+            }
+        }
+
+        public void ObserveIncluded(RebuildNode node, RebuildExecutionOptions execution)
+        {
+            IncludedNodes++;
+            if (node.IsDirectory)
+            {
+                IncludedDirectories++;
+            }
+            else
+            {
+                IncludedFiles++;
+            }
+
+            if (IncludedNodes == 1 || IncludedNodes % 250 == 0)
+            {
+                ReportProgress(
+                    execution,
+                    "Build tree",
+                    0,
+                    0,
+                    $"Included {IncludedNodes:N0} entries ({IncludedDirectories:N0} dirs, {IncludedFiles:N0} files); latest {ShortenProgressPath(node.RelativePath)}");
+            }
+        }
+    }
+
+    private sealed class LegacySnapshotConversionProgress
+    {
+        public long EntriesConverted { get; private set; }
+
+        public void Observe(string path, RebuildExecutionOptions execution)
+        {
+            EntriesConverted++;
+            if (EntriesConverted == 1 || EntriesConverted % 250 == 0)
+            {
+                ReportProgress(execution, "Convert legacy JSON", 0, 0, $"Converted {EntriesConverted:N0} metadata entries; latest {ShortenProgressPath(path)}");
+            }
+        }
+    }
+
     private sealed class RebuildNode
     {
         public string Name { get; init; } = string.Empty;
@@ -1290,52 +1588,85 @@ internal static class FatxImageRebuildCommand
             _deletedDirectories = deletedDirectories;
         }
 
-        public static SourceIndex Build(string liveRoot, string deletedRoot)
+        public static SourceIndex Build(string liveRoot, string deletedRoot, RebuildExecutionOptions execution)
         {
+            SourceRootIndex liveIndex;
+            SourceRootIndex deletedIndex;
+            if (HasUsableRoot(liveRoot) && HasUsableRoot(deletedRoot))
+            {
+                SourceRootIndex? liveTaskResult = null;
+                SourceRootIndex? deletedTaskResult = null;
+                Parallel.Invoke(
+                    () => liveTaskResult = BuildRootIndex(liveRoot, "live source", execution),
+                    () => deletedTaskResult = BuildRootIndex(deletedRoot, "deleted source", execution));
+                liveIndex = liveTaskResult ?? SourceRootIndex.Empty;
+                deletedIndex = deletedTaskResult ?? SourceRootIndex.Empty;
+            }
+            else
+            {
+                liveIndex = BuildRootIndex(liveRoot, "live source", execution);
+                deletedIndex = BuildRootIndex(deletedRoot, "deleted source", execution);
+            }
+
             return new SourceIndex(
-                BuildFileIndex(liveRoot),
-                BuildFileIndex(deletedRoot),
-                BuildDirectoryIndex(liveRoot),
-                BuildDirectoryIndex(deletedRoot));
+                liveIndex.Files,
+                deletedIndex.Files,
+                liveIndex.Directories,
+                deletedIndex.Directories);
         }
 
-        public bool HasDirectory(string relativePath)
+        public IEnumerable<SourceFileRecord> LiveFiles => _liveFiles.Select(entry => new SourceFileRecord(entry.Key, entry.Value));
+
+        public IEnumerable<SourceFileRecord> DeletedFiles => _deletedFiles.Select(entry => new SourceFileRecord(entry.Key, entry.Value));
+
+        public bool HasDirectory(string relativePath, out string canonicalPath)
         {
             relativePath = NormalizePath(relativePath);
+            canonicalPath = relativePath;
             if (string.IsNullOrEmpty(relativePath))
             {
                 return true;
             }
 
-            return _liveDirectories.Contains(relativePath)
-                || _deletedDirectories.Contains(relativePath)
-                || TryWithoutPartitionPrefix(relativePath, _liveDirectories)
-                || TryWithoutPartitionPrefix(relativePath, _deletedDirectories);
+            if (_liveDirectories.Contains(relativePath) || _deletedDirectories.Contains(relativePath))
+            {
+                return true;
+            }
+
+            if (TryWithoutPartitionPrefix(relativePath, _liveDirectories, out canonicalPath) ||
+                TryWithoutPartitionPrefix(relativePath, _deletedDirectories, out canonicalPath))
+            {
+                return true;
+            }
+
+            canonicalPath = relativePath;
+            return false;
         }
 
-        public string? FindFile(string relativePath, bool deletedPreference)
+        public string? FindFile(string relativePath, bool deletedPreference, out string canonicalPath)
         {
             relativePath = NormalizePath(relativePath);
+            canonicalPath = relativePath;
             if (deletedPreference)
             {
-                if (TryFindFile(_deletedFiles, relativePath, out var deleted))
+                if (TryFindFile(_deletedFiles, relativePath, out var deleted, out canonicalPath))
                 {
                     return deleted;
                 }
 
-                if (TryFindFile(_liveFiles, relativePath, out var liveFallback))
+                if (TryFindFile(_liveFiles, relativePath, out var liveFallback, out canonicalPath))
                 {
                     return liveFallback;
                 }
             }
             else
             {
-                if (TryFindFile(_liveFiles, relativePath, out var live))
+                if (TryFindFile(_liveFiles, relativePath, out var live, out canonicalPath))
                 {
                     return live;
                 }
 
-                if (TryFindFile(_deletedFiles, relativePath, out var deletedFallback))
+                if (TryFindFile(_deletedFiles, relativePath, out var deletedFallback, out canonicalPath))
                 {
                     return deletedFallback;
                 }
@@ -1344,44 +1675,47 @@ internal static class FatxImageRebuildCommand
             return null;
         }
 
-        private static Dictionary<string, string> BuildFileIndex(string root)
+        private static bool HasUsableRoot(string root)
         {
-            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+            return !string.IsNullOrWhiteSpace(root) && Directory.Exists(root);
+        }
+
+        private static SourceRootIndex BuildRootIndex(string root, string label, RebuildExecutionOptions execution)
+        {
+            if (!HasUsableRoot(root))
             {
-                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                return SourceRootIndex.Empty;
             }
 
-            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { string.Empty };
+            ReportProgress(execution, "Index sources", 0, 0, $"Scanning {label}: {root}");
+            foreach (var path in Directory.EnumerateFileSystemEntries(root, "*", SearchOption.AllDirectories))
             {
-                var relative = NormalizePath(Path.GetRelativePath(root, file));
-                if (!map.ContainsKey(relative))
+                var relative = NormalizePath(Path.GetRelativePath(root, path));
+                if (Directory.Exists(path))
                 {
-                    map.Add(relative, file);
+                    directories.Add(relative);
+                }
+                else if (!files.ContainsKey(relative))
+                {
+                    files.Add(relative, path);
+                }
+
+                var total = files.Count + directories.Count;
+                if (total % 250 == 0)
+                {
+                    ReportProgress(execution, "Index sources", 0, 0, $"{label}: {files.Count:N0} files, {directories.Count:N0} dirs; latest {ShortenProgressPath(relative)}");
                 }
             }
 
-            return map;
+            ReportProgress(execution, "Index sources", 0, 0, $"{label}: indexed {files.Count:N0} files and {directories.Count:N0} directories");
+            return new SourceRootIndex(files, directories);
         }
 
-        private static HashSet<string> BuildDirectoryIndex(string root)
+        private static bool TryFindFile(Dictionary<string, string> map, string relativePath, out string path, out string canonicalPath)
         {
-            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { string.Empty };
-            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
-            {
-                return set;
-            }
-
-            foreach (var directory in Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories))
-            {
-                set.Add(NormalizePath(Path.GetRelativePath(root, directory)));
-            }
-
-            return set;
-        }
-
-        private static bool TryFindFile(Dictionary<string, string> map, string relativePath, out string path)
-        {
+            canonicalPath = relativePath;
             if (map.TryGetValue(relativePath, out path!))
             {
                 return true;
@@ -1393,6 +1727,7 @@ internal static class FatxImageRebuildCommand
                 var trimmed = relativePath[(separator + 1)..];
                 if (map.TryGetValue(trimmed, out path!))
                 {
+                    canonicalPath = trimmed;
                     return true;
                 }
             }
@@ -1400,15 +1735,16 @@ internal static class FatxImageRebuildCommand
             return false;
         }
 
-        private static bool TryWithoutPartitionPrefix(string relativePath, HashSet<string> set)
+        private static bool TryWithoutPartitionPrefix(string relativePath, HashSet<string> set, out string trimmed)
         {
+            trimmed = string.Empty;
             var separator = relativePath.IndexOf('/');
             if (separator <= 0)
             {
                 return false;
             }
 
-            var trimmed = relativePath[(separator + 1)..];
+            trimmed = relativePath[(separator + 1)..];
             return set.Contains(trimmed);
         }
     }
@@ -1417,6 +1753,7 @@ internal static class FatxImageRebuildCommand
     {
         private readonly bool[] _used;
         private readonly uint _maxCluster;
+        private uint _nextSearchCluster = 1;
 
         public ClusterAllocator(uint maxCluster)
         {
@@ -1440,6 +1777,7 @@ internal static class FatxImageRebuildCommand
                 _used[cluster] = true;
             }
 
+            AdvanceNextSearchCluster();
             return true;
         }
 
@@ -1472,6 +1810,12 @@ internal static class FatxImageRebuildCommand
                 clusters.Add(cluster);
             }
 
+            if (start <= _nextSearchCluster && end >= _nextSearchCluster)
+            {
+                _nextSearchCluster = end == uint.MaxValue ? end : end + 1;
+                AdvanceNextSearchCluster();
+            }
+
             return true;
         }
 
@@ -1482,7 +1826,17 @@ internal static class FatxImageRebuildCommand
                 return [];
             }
 
-            for (uint cluster = 1; cluster <= _maxCluster; cluster++)
+            for (uint cluster = _nextSearchCluster; cluster <= _maxCluster; cluster++)
+            {
+                if (!TryAllocateContiguous(cluster, count, out var allocated))
+                {
+                    continue;
+                }
+
+                return allocated;
+            }
+
+            for (uint cluster = 1; cluster < _nextSearchCluster; cluster++)
             {
                 if (!TryAllocateContiguous(cluster, count, out var allocated))
                 {
@@ -1493,6 +1847,58 @@ internal static class FatxImageRebuildCommand
             }
 
             throw new IOException($"Not enough free clusters to allocate {count} cluster(s).");
+        }
+
+        public List<uint> AllocateAny(int count)
+        {
+            if (count <= 0)
+            {
+                return [];
+            }
+
+            var clusters = new List<uint>(count);
+            CollectFreeClusters(_nextSearchCluster, _maxCluster, count, clusters);
+            if (clusters.Count < count && _nextSearchCluster > 1)
+            {
+                CollectFreeClusters(1, _nextSearchCluster - 1, count, clusters);
+            }
+
+            if (clusters.Count < count)
+            {
+                throw new IOException($"Not enough free clusters to allocate {count} cluster(s).");
+            }
+
+            foreach (var cluster in clusters)
+            {
+                _used[cluster] = true;
+            }
+
+            AdvanceNextSearchCluster();
+            return clusters;
+        }
+
+        private void CollectFreeClusters(uint start, uint end, int count, List<uint> clusters)
+        {
+            if (start == 0 || start > end)
+            {
+                return;
+            }
+
+            for (var cluster = start; cluster <= end && clusters.Count < count; cluster++)
+            {
+                if (!_used[cluster])
+                {
+                    clusters.Add(cluster);
+                }
+            }
+        }
+
+        private void AdvanceNextSearchCluster()
+        {
+            while (_nextSearchCluster <= _maxCluster && _used[_nextSearchCluster])
+            {
+                _nextSearchCluster++;
+            }
         }
     }
 
@@ -1676,6 +2082,15 @@ internal static class FatxImageRebuildCommand
             return args[index];
         }
     }
+
+    private sealed record SourceRootIndex(Dictionary<string, string> Files, HashSet<string> Directories)
+    {
+        public static SourceRootIndex Empty { get; } = new(
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { string.Empty });
+    }
+
+    private sealed record SourceFileRecord(string RelativePath, string SourcePath);
 }
 
 public sealed record RebuildProgressSnapshot(string Stage, long Completed, long Total, string Detail)
@@ -1694,6 +2109,117 @@ public sealed class RebuildExecutionOptions
     public Action<RebuildProgressSnapshot>? Progress { get; init; }
 
     public int PayloadWorkerCount { get; init; }
+}
+
+internal sealed class ProgressEtaEstimator
+{
+    private readonly Queue<(DateTime TimestampUtc, double Percent)> _samples = new();
+    private DateTime _startedAtUtc = DateTime.UtcNow;
+    private double _lastPercent = double.NaN;
+
+    public string BuildStatus(double percent, string? stateText)
+    {
+        var now = DateTime.UtcNow;
+        var clampedPercent = Math.Clamp(percent, 0d, 100d);
+        if (double.IsNaN(_lastPercent) || clampedPercent + 0.001 < _lastPercent)
+        {
+            Reset(now, clampedPercent);
+        }
+
+        TrackSample(now, clampedPercent);
+
+        var elapsed = now - _startedAtUtc;
+        if (clampedPercent >= 100 || IsTerminal(stateText))
+        {
+            return $"Elapsed {FormatDuration(elapsed)}";
+        }
+
+        var eta = TryEstimateEta(clampedPercent);
+        if (eta == null)
+        {
+            return $"ETA calculating, elapsed {FormatDuration(elapsed)}";
+        }
+
+        return $"ETA {FormatDuration(eta.Value)}, elapsed {FormatDuration(elapsed)}";
+    }
+
+    private void Reset(DateTime now, double percent)
+    {
+        _samples.Clear();
+        _startedAtUtc = now;
+        _lastPercent = percent;
+    }
+
+    private void TrackSample(DateTime now, double percent)
+    {
+        if (_samples.Count == 0 || percent > _lastPercent + 0.001)
+        {
+            _samples.Enqueue((now, percent));
+        }
+        else if (_samples.Count == 0)
+        {
+            _samples.Enqueue((now, percent));
+        }
+
+        _lastPercent = Math.Max(_lastPercent, percent);
+        var cutoff = now - TimeSpan.FromSeconds(45);
+        while (_samples.Count > 2 && _samples.Peek().TimestampUtc < cutoff)
+        {
+            _samples.Dequeue();
+        }
+    }
+
+    private TimeSpan? TryEstimateEta(double percent)
+    {
+        if (percent <= 0.1 || _samples.Count < 2)
+        {
+            return null;
+        }
+
+        var first = _samples.Peek();
+        var latest = _samples.Last();
+        var deltaPercent = latest.Percent - first.Percent;
+        var deltaSeconds = (latest.TimestampUtc - first.TimestampUtc).TotalSeconds;
+        if (deltaPercent <= 0.01 || deltaSeconds <= 0.1)
+        {
+            return null;
+        }
+
+        var percentPerSecond = deltaPercent / deltaSeconds;
+        if (percentPerSecond <= 0)
+        {
+            return null;
+        }
+
+        var remainingPercent = Math.Max(0, 100 - percent);
+        return TimeSpan.FromSeconds(remainingPercent / percentPerSecond);
+    }
+
+    private static bool IsTerminal(string? stateText)
+    {
+        if (string.IsNullOrWhiteSpace(stateText))
+        {
+            return false;
+        }
+
+        return stateText.Contains("canceled", StringComparison.OrdinalIgnoreCase)
+            || stateText.Contains("failed", StringComparison.OrdinalIgnoreCase)
+            || stateText.Contains("complete", StringComparison.OrdinalIgnoreCase)
+            || stateText.Contains("done", StringComparison.OrdinalIgnoreCase)
+            || stateText.Contains("ready", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FormatDuration(TimeSpan value)
+    {
+        if (value < TimeSpan.Zero)
+        {
+            value = TimeSpan.Zero;
+        }
+
+        return value.TotalHours >= 1
+            ? value.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture)
+            : value.ToString(@"mm\:ss", CultureInfo.InvariantCulture);
+    }
 }
 
 internal sealed class RebuildSnapshot

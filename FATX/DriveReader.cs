@@ -155,6 +155,7 @@ namespace FATX
 
         private void AddXbox360DevkitHeaderPartitions(bool exhaustiveRawPartitionSearch)
         {
+            var initialPartitionCount = _partitions.Count;
             var knownHeaderNames = new Dictionary<int, string>
             {
                 [0] = "Partition1",
@@ -219,7 +220,8 @@ namespace FATX
                 AddPartitionIfValid(knownOffset.Value, knownOffset.Key, nextOffset - knownOffset.Key);
             }
 
-            if (exhaustiveRawPartitionSearch)
+            var discoveredFromHeader = _partitions.Count > initialPartitionCount;
+            if (exhaustiveRawPartitionSearch && !discoveredFromHeader)
             {
                 SearchForAdditionalPartitions();
             }

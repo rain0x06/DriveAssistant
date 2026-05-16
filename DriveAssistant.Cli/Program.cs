@@ -538,7 +538,7 @@ internal sealed class GenericCliEntry : CliEntry
 
     public GenericFileSystemEntry Entry { get; }
 
-    public override IReadOnlyList<CliEntry> GetChildren() => Entry.Children.Select(entry => new GenericCliEntry(entry)).ToList();
+    public override IReadOnlyList<CliEntry> GetChildren() => Entry.Volume.GetChildren(Entry).Select(entry => new GenericCliEntry(entry)).ToList();
 
     private static string Normalize(string path) => path.Replace('\\', '/');
 }

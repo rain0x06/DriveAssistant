@@ -416,7 +416,7 @@ internal sealed class GenericDesktopEntry : DesktopEntry
 
     public GenericFileSystemEntry Entry { get; }
 
-    public override IReadOnlyList<DesktopEntry> GetChildren() => Entry.Children.Select(entry => new GenericDesktopEntry(entry)).ToList();
+    public override IReadOnlyList<DesktopEntry> GetChildren() => Entry.Volume.GetChildren(Entry).Select(entry => new GenericDesktopEntry(entry)).ToList();
 
     private static string Normalize(string path) => path.Replace('\\', '/');
 }

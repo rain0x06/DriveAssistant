@@ -266,7 +266,7 @@ public sealed partial class MainWindow : Window
                             progressDialog.Update(snapshot.Percent, snapshot.Stage, snapshot.Detail);
                             ViewModel.StatusText = Volatile.Read(ref pauseFlag) == 1
                                 ? "FATX rebuild paused"
-                                : $"Rebuilding FATX image from JSON... {snapshot.Percent:0}%";
+                                : $"Rebuilding FATX image from JSON... {snapshot.Percent:0}% - {snapshot.Stage}: {snapshot.Detail}";
                         });
                     }
                 });
@@ -765,6 +765,7 @@ internal sealed class RebuildProgressDialog : Window
     private readonly TextBlock _stageText;
     private readonly TextBlock _detailText;
     private readonly Button _pauseButton;
+    private readonly ProgressEtaEstimator _etaEstimator = new();
     private bool _isPaused;
 
     public RebuildProgressDialog()
@@ -849,9 +850,13 @@ internal sealed class RebuildProgressDialog : Window
 
     public void Update(int percent, string stage, string detail)
     {
-        _progressBar.Value = Math.Clamp(percent, 0, 100);
-        _stageText.Text = $"{Math.Clamp(percent, 0, 100):0}% - {stage}";
-        _detailText.Text = detail;
+        var clampedPercent = Math.Clamp(percent, 0, 100);
+        _progressBar.Value = clampedPercent;
+        _stageText.Text = $"{clampedPercent:0}% - {stage}";
+        var etaText = _etaEstimator.BuildStatus(clampedPercent, stage);
+        _detailText.Text = string.IsNullOrWhiteSpace(etaText)
+            ? detail
+            : $"{detail} | {etaText}";
     }
 }
 

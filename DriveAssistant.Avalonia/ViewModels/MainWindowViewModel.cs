@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using DriveAssistant.Avalonia;
 using DriveAssistant.Avalonia.Core;
 
 namespace DriveAssistant.Avalonia.ViewModels;
@@ -779,6 +780,7 @@ public sealed class ScanProgressRowViewModel : ObservableObject
     private double _value;
     private string _text = "0%";
     private bool _isIndeterminate;
+    private readonly ProgressEtaEstimator _etaEstimator = new();
 
     public ScanProgressRowViewModel(string title)
     {
@@ -809,13 +811,19 @@ public sealed class ScanProgressRowViewModel : ObservableObject
     {
         IsIndeterminate = false;
         Value = value;
-        Text = text;
+        var etaText = _etaEstimator.BuildStatus(value, text);
+        Text = string.IsNullOrWhiteSpace(etaText)
+            ? text
+            : $"{text} | {etaText}";
     }
 
     public void UpdateIndeterminate(string text)
     {
         IsIndeterminate = true;
-        Text = text;
+        var etaText = _etaEstimator.BuildIndeterminateStatus(text);
+        Text = string.IsNullOrWhiteSpace(etaText)
+            ? text
+            : $"{text} | {etaText}";
     }
 }
 

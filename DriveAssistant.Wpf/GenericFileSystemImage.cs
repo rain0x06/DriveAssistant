@@ -333,7 +333,7 @@ public abstract class GenericFileSystemVolume
 
     public abstract IReadOnlyList<GenericFileSystemEntry> GetRoot();
 
-    public IReadOnlyList<GenericFileSystemEntry> GetChildren(GenericFileSystemEntry? directory)
+    public virtual IReadOnlyList<GenericFileSystemEntry> GetChildren(GenericFileSystemEntry? directory)
     {
         return directory?.Children ?? GetRoot();
     }
@@ -479,6 +479,7 @@ public sealed class GenericFileSystemEntry
 public sealed class Fat32Volume : GenericFileSystemVolume
 {
     private readonly List<GenericFileSystemEntry> _root = [];
+    private readonly HashSet<uint> _loadedDirectoryClusters = [];
     private readonly uint[] _fat;
     private readonly ushort _bytesPerSector;
     private readonly byte _sectorsPerCluster;
@@ -538,16 +539,41 @@ public sealed class Fat32Volume : GenericFileSystemVolume
 
         var dataOffset = partition.Offset + ((long)reservedSectors + fatCount * (long)sectorsPerFat) * bytesPerSector;
         var volume = new Fat32Volume(sourcePath, partition, bytesPerSector, sectorsPerCluster, rootCluster, dataOffset, fat);
-        volume._root.AddRange(volume.ReadDirectory(rootCluster, "/", includeDeleted: false, CancellationToken.None));
+        volume._root.AddRange(volume.ReadDirectory(rootCluster, "/", includeDeleted: false, CancellationToken.None, new HashSet<uint>(), loadChildren: false));
+        volume._loadedDirectoryClusters.Add(rootCluster);
         return volume;
     }
 
     public override IReadOnlyList<GenericFileSystemEntry> GetRoot() => _root;
 
+    public override IReadOnlyList<GenericFileSystemEntry> GetChildren(GenericFileSystemEntry? directory)
+    {
+        if (directory == null)
+        {
+            return _root;
+        }
+
+        if (!directory.IsDirectory || directory.IsDeleted || directory.Cluster < 2)
+        {
+            return directory.Children;
+        }
+
+        var cluster = (uint)directory.Cluster;
+        lock (_loadedDirectoryClusters)
+        {
+            if (_loadedDirectoryClusters.Add(cluster))
+            {
+                directory.Children.AddRange(ReadDirectory(cluster, directory.Path, includeDeleted: false, CancellationToken.None, new HashSet<uint>(), loadChildren: false));
+            }
+        }
+
+        return directory.Children;
+    }
+
     public override IReadOnlyList<GenericFileSystemEntry> ScanDeleted(CancellationToken cancellationToken, IProgress<int>? progress)
     {
         var rows = new List<GenericFileSystemEntry>();
-        ScanDeletedDirectory(_rootCluster, "/", rows, cancellationToken);
+        ScanDeletedDirectory(_rootCluster, "/", rows, cancellationToken, new HashSet<uint>());
         progress?.Report(rows.Count);
         return rows;
     }
@@ -557,9 +583,14 @@ public sealed class Fat32Volume : GenericFileSystemVolume
         return _dataOffset + (cluster - 2L) * ClusterSize;
     }
 
-    private void ScanDeletedDirectory(uint cluster, string path, List<GenericFileSystemEntry> rows, CancellationToken cancellationToken)
+    private void ScanDeletedDirectory(uint cluster, string path, List<GenericFileSystemEntry> rows, CancellationToken cancellationToken, HashSet<uint> visitedDirectories)
     {
-        foreach (var entry in ReadDirectory(cluster, path, includeDeleted: true, cancellationToken))
+        if (!visitedDirectories.Add(cluster))
+        {
+            return;
+        }
+
+        foreach (var entry in ReadDirectory(cluster, path, includeDeleted: true, cancellationToken, visitedDirectories, currentDirectoryAlreadyVisited: true, loadChildren: false))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (entry.IsDeleted)
@@ -568,15 +599,40 @@ public sealed class Fat32Volume : GenericFileSystemVolume
             }
             else if (entry.IsDirectory && entry.Cluster >= 2)
             {
-                ScanDeletedDirectory((uint)entry.Cluster, entry.Path, rows, cancellationToken);
+                ScanDeletedDirectory((uint)entry.Cluster, entry.Path, rows, cancellationToken, visitedDirectories);
             }
         }
+
+        visitedDirectories.Remove(cluster);
     }
 
-    private List<GenericFileSystemEntry> ReadDirectory(uint firstCluster, string path, bool includeDeleted, CancellationToken cancellationToken)
+    private List<GenericFileSystemEntry> ReadDirectory(
+        uint firstCluster,
+        string path,
+        bool includeDeleted,
+        CancellationToken cancellationToken,
+        HashSet<uint> visitedDirectories,
+        bool currentDirectoryAlreadyVisited = false,
+        bool loadChildren = true)
     {
+        var addedCurrentDirectory = false;
+        if (!currentDirectoryAlreadyVisited)
+        {
+            if (!visitedDirectories.Add(firstCluster))
+            {
+                return [];
+            }
+
+            addedCurrentDirectory = true;
+        }
+        else if (!visitedDirectories.Contains(firstCluster))
+        {
+            return [];
+        }
+
         var entries = new List<GenericFileSystemEntry>();
         var lfnParts = new List<string>();
+        var completed = false;
         foreach (var cluster in GetClusterChain(firstCluster))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -587,7 +643,8 @@ public sealed class Fat32Volume : GenericFileSystemVolume
                 var first = entry[0];
                 if (first == 0x00)
                 {
-                    return entries;
+                    completed = true;
+                    break;
                 }
 
                 var attr = entry[11];
@@ -598,6 +655,12 @@ public sealed class Fat32Volume : GenericFileSystemVolume
                 }
 
                 var deleted = first == 0xE5;
+                if (!IsPlausibleFatShortEntry(entry, deleted))
+                {
+                    lfnParts.Clear();
+                    continue;
+                }
+
                 if (deleted && !includeDeleted)
                 {
                     lfnParts.Clear();
@@ -652,13 +715,23 @@ public sealed class Fat32Volume : GenericFileSystemVolume
                     Extents = extents
                 };
 
-                if (!deleted && isDirectory && firstDataCluster >= 2)
+                if (loadChildren && !deleted && isDirectory && firstDataCluster >= 2)
                 {
-                    item.Children.AddRange(ReadDirectory(firstDataCluster, childPath, includeDeleted: false, cancellationToken));
+                    item.Children.AddRange(ReadDirectory(firstDataCluster, childPath, includeDeleted: false, cancellationToken, visitedDirectories, loadChildren: true));
                 }
 
                 entries.Add(item);
             }
+
+            if (completed)
+            {
+                break;
+            }
+        }
+
+        if (addedCurrentDirectory)
+        {
+            visitedDirectories.Remove(firstCluster);
         }
 
         return entries;
@@ -713,6 +786,48 @@ public sealed class Fat32Volume : GenericFileSystemVolume
         entry.Slice(14, 12).CopyTo(raw[10..]);
         entry.Slice(28, 4).CopyTo(raw[22..]);
         return Encoding.Unicode.GetString(raw).TrimEnd('\0', '\uffff');
+    }
+
+    private static bool IsPlausibleFatShortEntry(ReadOnlySpan<byte> entry, bool deleted)
+    {
+        var attr = entry[11];
+        if ((attr & 0xC0) != 0)
+        {
+            return false;
+        }
+
+        if ((attr & 0x18) == 0x18)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < 11; index++)
+        {
+            var value = entry[index];
+            if (index == 0 && deleted && value == 0xE5)
+            {
+                continue;
+            }
+
+            if (value == 0x20)
+            {
+                continue;
+            }
+
+            if (value < 0x21 || value > 0x7E || IsInvalidFatShortNameCharacter(value))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsInvalidFatShortNameCharacter(byte value)
+    {
+        return value is (byte)'"' or (byte)'*' or (byte)'+' or (byte)',' or (byte)'.' or (byte)'/' or (byte)':'
+            or (byte)';' or (byte)'<' or (byte)'=' or (byte)'>' or (byte)'?' or (byte)'[' or (byte)'\\'
+            or (byte)']' or (byte)'|';
     }
 
     private static string DecodeFatShortName(ReadOnlySpan<byte> entry, bool deleted)
@@ -783,6 +898,7 @@ public sealed class Fat32Volume : GenericFileSystemVolume
 public sealed class Fat16Volume : GenericFileSystemVolume
 {
     private readonly List<GenericFileSystemEntry> _root = [];
+    private readonly HashSet<uint> _loadedDirectoryClusters = [];
     private readonly ushort[] _fat;
     private readonly ushort _bytesPerSector;
     private readonly byte _sectorsPerCluster;
@@ -853,16 +969,41 @@ public sealed class Fat16Volume : GenericFileSystemVolume
         var rootDirectoryLength = ((rootEntryCount * 32L + bytesPerSector - 1) / bytesPerSector) * bytesPerSector;
         var dataOffset = rootDirectoryOffset + rootDirectoryLength;
         var volume = new Fat16Volume(sourcePath, partition, bytesPerSector, sectorsPerCluster, rootEntryCount, rootDirectoryOffset, rootDirectoryLength, dataOffset, fat);
-        volume._root.AddRange(volume.ReadDirectoryBytes(volume.ReadBytes(rootDirectoryOffset, rootDirectoryLength), "/", rootDirectoryOffset, includeDeleted: false, CancellationToken.None));
+        volume._root.AddRange(volume.ReadDirectoryBytes(volume.ReadBytes(rootDirectoryOffset, rootDirectoryLength), "/", rootDirectoryOffset, includeDeleted: false, CancellationToken.None, new HashSet<uint>(), loadChildren: false));
         return volume;
     }
 
     public override IReadOnlyList<GenericFileSystemEntry> GetRoot() => _root;
 
+    public override IReadOnlyList<GenericFileSystemEntry> GetChildren(GenericFileSystemEntry? directory)
+    {
+        if (directory == null)
+        {
+            return _root;
+        }
+
+        if (!directory.IsDirectory || directory.IsDeleted || directory.Cluster < 2)
+        {
+            return directory.Children;
+        }
+
+        var cluster = (uint)directory.Cluster;
+        lock (_loadedDirectoryClusters)
+        {
+            if (_loadedDirectoryClusters.Add(cluster))
+            {
+                directory.Children.AddRange(ReadDirectoryClusterChain(cluster, directory.Path, includeDeleted: false, CancellationToken.None, new HashSet<uint>(), loadChildren: false));
+            }
+        }
+
+        return directory.Children;
+    }
+
     public override IReadOnlyList<GenericFileSystemEntry> ScanDeleted(CancellationToken cancellationToken, IProgress<int>? progress)
     {
         var rows = new List<GenericFileSystemEntry>();
-        foreach (var entry in ReadDirectoryBytes(ReadBytes(_rootDirectoryOffset, _rootDirectoryLength), "/", _rootDirectoryOffset, includeDeleted: true, cancellationToken))
+        var visitedDirectories = new HashSet<uint>();
+        foreach (var entry in ReadDirectoryBytes(ReadBytes(_rootDirectoryOffset, _rootDirectoryLength), "/", _rootDirectoryOffset, includeDeleted: true, cancellationToken, visitedDirectories, loadChildren: false))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (entry.IsDeleted)
@@ -871,7 +1012,7 @@ public sealed class Fat16Volume : GenericFileSystemVolume
             }
             else if (entry.IsDirectory && entry.Cluster >= 2)
             {
-                ScanDeletedDirectory((uint)entry.Cluster, entry.Path, rows, cancellationToken);
+                ScanDeletedDirectory((uint)entry.Cluster, entry.Path, rows, cancellationToken, visitedDirectories);
             }
         }
 
@@ -884,9 +1025,14 @@ public sealed class Fat16Volume : GenericFileSystemVolume
         return _dataOffset + (cluster - 2L) * ClusterSize;
     }
 
-    private void ScanDeletedDirectory(uint cluster, string path, List<GenericFileSystemEntry> rows, CancellationToken cancellationToken)
+    private void ScanDeletedDirectory(uint cluster, string path, List<GenericFileSystemEntry> rows, CancellationToken cancellationToken, HashSet<uint> visitedDirectories)
     {
-        foreach (var entry in ReadDirectoryClusterChain(cluster, path, includeDeleted: true, cancellationToken))
+        if (!visitedDirectories.Add(cluster))
+        {
+            return;
+        }
+
+        foreach (var entry in ReadDirectoryClusterChain(cluster, path, includeDeleted: true, cancellationToken, visitedDirectories, currentDirectoryAlreadyVisited: true, loadChildren: false))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (entry.IsDeleted)
@@ -895,13 +1041,37 @@ public sealed class Fat16Volume : GenericFileSystemVolume
             }
             else if (entry.IsDirectory && entry.Cluster >= 2)
             {
-                ScanDeletedDirectory((uint)entry.Cluster, entry.Path, rows, cancellationToken);
+                ScanDeletedDirectory((uint)entry.Cluster, entry.Path, rows, cancellationToken, visitedDirectories);
             }
         }
+
+        visitedDirectories.Remove(cluster);
     }
 
-    private List<GenericFileSystemEntry> ReadDirectoryClusterChain(uint firstCluster, string path, bool includeDeleted, CancellationToken cancellationToken)
+    private List<GenericFileSystemEntry> ReadDirectoryClusterChain(
+        uint firstCluster,
+        string path,
+        bool includeDeleted,
+        CancellationToken cancellationToken,
+        HashSet<uint> visitedDirectories,
+        bool currentDirectoryAlreadyVisited = false,
+        bool loadChildren = true)
     {
+        var addedCurrentDirectory = false;
+        if (!currentDirectoryAlreadyVisited)
+        {
+            if (!visitedDirectories.Add(firstCluster))
+            {
+                return [];
+            }
+
+            addedCurrentDirectory = true;
+        }
+        else if (!visitedDirectories.Contains(firstCluster))
+        {
+            return [];
+        }
+
         using var output = new MemoryStream();
         foreach (var cluster in GetClusterChain(firstCluster))
         {
@@ -910,10 +1080,23 @@ public sealed class Fat16Volume : GenericFileSystemVolume
             output.Write(data, 0, data.Length);
         }
 
-        return ReadDirectoryBytes(output.ToArray(), path, ClusterToOffset(firstCluster), includeDeleted, cancellationToken);
+        var entries = ReadDirectoryBytes(output.ToArray(), path, ClusterToOffset(firstCluster), includeDeleted, cancellationToken, visitedDirectories, loadChildren);
+        if (addedCurrentDirectory)
+        {
+            visitedDirectories.Remove(firstCluster);
+        }
+
+        return entries;
     }
 
-    private List<GenericFileSystemEntry> ReadDirectoryBytes(byte[] data, string path, long directoryOffset, bool includeDeleted, CancellationToken cancellationToken)
+    private List<GenericFileSystemEntry> ReadDirectoryBytes(
+        byte[] data,
+        string path,
+        long directoryOffset,
+        bool includeDeleted,
+        CancellationToken cancellationToken,
+        HashSet<uint> visitedDirectories,
+        bool loadChildren = true)
     {
         var entries = new List<GenericFileSystemEntry>();
         var lfnParts = new List<string>();
@@ -935,6 +1118,12 @@ public sealed class Fat16Volume : GenericFileSystemVolume
             }
 
             var deleted = first == 0xE5;
+            if (!IsPlausibleFatShortEntry(entry, deleted))
+            {
+                lfnParts.Clear();
+                continue;
+            }
+
             if (deleted && !includeDeleted)
             {
                 lfnParts.Clear();
@@ -988,9 +1177,9 @@ public sealed class Fat16Volume : GenericFileSystemVolume
                 Extents = extents
             };
 
-            if (!deleted && isDirectory && firstDataCluster >= 2)
+            if (loadChildren && !deleted && isDirectory && firstDataCluster >= 2)
             {
-                item.Children.AddRange(ReadDirectoryClusterChain(firstDataCluster, childPath, includeDeleted: false, cancellationToken));
+                item.Children.AddRange(ReadDirectoryClusterChain(firstDataCluster, childPath, includeDeleted: false, cancellationToken, visitedDirectories, loadChildren: true));
             }
 
             entries.Add(item);
@@ -1048,6 +1237,48 @@ public sealed class Fat16Volume : GenericFileSystemVolume
         entry.Slice(14, 12).CopyTo(raw[10..]);
         entry.Slice(28, 4).CopyTo(raw[22..]);
         return Encoding.Unicode.GetString(raw).TrimEnd('\0', '\uffff');
+    }
+
+    private static bool IsPlausibleFatShortEntry(ReadOnlySpan<byte> entry, bool deleted)
+    {
+        var attr = entry[11];
+        if ((attr & 0xC0) != 0)
+        {
+            return false;
+        }
+
+        if ((attr & 0x18) == 0x18)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < 11; index++)
+        {
+            var value = entry[index];
+            if (index == 0 && deleted && value == 0xE5)
+            {
+                continue;
+            }
+
+            if (value == 0x20)
+            {
+                continue;
+            }
+
+            if (value < 0x21 || value > 0x7E || IsInvalidFatShortNameCharacter(value))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsInvalidFatShortNameCharacter(byte value)
+    {
+        return value is (byte)'"' or (byte)'*' or (byte)'+' or (byte)',' or (byte)'.' or (byte)'/' or (byte)':'
+            or (byte)';' or (byte)'<' or (byte)'=' or (byte)'>' or (byte)'?' or (byte)'[' or (byte)'\\'
+            or (byte)']' or (byte)'|';
     }
 
     private static string DecodeFatShortName(ReadOnlySpan<byte> entry, bool deleted)
